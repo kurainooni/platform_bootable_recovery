@@ -11,7 +11,10 @@ LOCAL_SRC_FILES := \
     ui.cpp \
     screen_ui.cpp \
     verifier.cpp \
-    adb_install.cpp
+    adb_install.cpp \
+    crc/ldcrc.cpp \
+    crc/ldcrctable.cpp \
+    rkimage.cpp
 
 LOCAL_MODULE := recovery
 
@@ -26,6 +29,13 @@ ifeq ($(TARGET_USERIMAGES_USE_EXT4), true)
 LOCAL_CFLAGS += -DUSE_EXT4
 LOCAL_C_INCLUDES += system/extras/ext4_utils
 LOCAL_STATIC_LIBRARIES += libext4_utils libz
+endif
+
+ifeq ($(strip $(TARGET_BOARD_HARDWARE)),rk30board)
+LOCAL_CFLAGS += -DTARGET_RK30
+endif
+ifeq ($(strip $(TARGET_BOARD_HARDWARE)),rk2928board)
+LOCAL_CFLAGS += -DTARGET_RK30
 endif
 
 ifeq ($(HAVE_SELINUX), true)
@@ -46,10 +56,18 @@ ifeq ($(TARGET_RECOVERY_UI_LIB),)
 else
   LOCAL_STATIC_LIBRARIES += $(TARGET_RECOVERY_UI_LIB)
 endif
+
+# TARGET_BOARD_PLATFORM is change from rockchip to rk29xx or rk30xx
+# so force TARGET_BOARD_PLATFORM to be rockchip in recovery cpp file
+LOCAL_CFLAGS += -DTARGET_BOARD_PLATFORM=rockchip
+LOCAL_CFLAGS += -fpermissive
+
 LOCAL_STATIC_LIBRARIES += libext4_utils
-LOCAL_STATIC_LIBRARIES += libminzip libz libmtdutils libmincrypt libminadbd
+LOCAL_STATIC_LIBRARIES += libminzip libunz libmtdutils libmincrypt libminadbd libedify libapplypatch
 LOCAL_STATIC_LIBRARIES += libminui libpixelflinger_static libpng libcutils
 LOCAL_STATIC_LIBRARIES += libstdc++ libc
+LOCAL_STATIC_LIBRARIES += libz libbz
+LOCAL_STATIC_LIBRARIES += libminelf
 
 ifeq ($(HAVE_SELINUX),true)
 LOCAL_C_INCLUDES += external/libselinux/include

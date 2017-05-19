@@ -29,6 +29,9 @@
 #include "applypatch.h"
 #include "mtdutils/mtdutils.h"
 #include "edify/expr.h"
+#if TARGET_BOARD_PLATFORM == rockchip
+#include "mtdutils/rk29.h"
+#endif
 
 static int LoadPartitionContents(const char* filename, FileContents* file);
 static ssize_t FileSink(unsigned char* data, ssize_t len, void* token);
@@ -242,7 +245,11 @@ static int LoadPartitionContents(const char* filename, FileContents* file) {
                     break;
 
                 case EMMC:
+#if TARGET_BOARD_PLATFORM == rockchip
+                    read = rk29_fread(p, 1, next, dev);
+#else
                     read = fread(p, 1, next, dev);
+#endif
                     break;
             }
             if (next != read) {
@@ -421,8 +428,13 @@ int WriteToPartition(unsigned char* data, size_t len,
 
         case EMMC:
             ;
+#if TARGET_BOARD_PLATFORM == rockchip
+            FILE* f = fopen(partition, "wb+");
+            if (rk29_fwrite(data, 1, len, f) != len) {
+#else
             FILE* f = fopen(partition, "wb");
             if (fwrite(data, 1, len, f) != len) {
+#endif
                 printf("short write writing to %s (%s)\n",
                        partition, strerror(errno));
                 return -1;

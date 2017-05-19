@@ -33,6 +33,7 @@
 #include "roots.h"
 #include "verifier.h"
 #include "ui.h"
+#include "bootloader.h"
 
 extern RecoveryUI* ui;
 
@@ -44,6 +45,10 @@ static const int VERIFICATION_PROGRESS_TIME = 60;
 static const float VERIFICATION_PROGRESS_FRACTION = 0.25;
 static const float DEFAULT_FILES_PROGRESS_FRACTION = 0.4;
 static const float DEFAULT_IMAGE_PROGRESS_FRACTION = 0.1;
+
+#if TARGET_BOARD_PLATFORM == rockchip
+extern bool bClearbootmessage;
+#endif
 
 // If the package contains an update binary, extract it and run it.
 static int
@@ -253,6 +258,13 @@ exit:
 static int
 really_install_package(const char *path, int* wipe_cache)
 {
+	//by mmk@rock-chips.com
+	//if update loader, we hope not clear misc command.
+	//default not clear misc command, let the update-script of update.zip to clear misc when no update loader.
+#if TARGET_BOARD_PLATFORM == rockchip
+	bClearbootmessage = true;
+#endif
+
     ui->SetBackground(RecoveryUI::INSTALLING);
     ui->Print("Finding update package...\n");
     ui->SetProgressType(RecoveryUI::INDETERMINATE);

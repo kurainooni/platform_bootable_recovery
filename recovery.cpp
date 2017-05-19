@@ -28,6 +28,7 @@
 #include <time.h>
 #include <unistd.h>
 #include <dirent.h>
+#include <inttypes.h>
 
 #include "bootloader.h"
 #include "common.h"
@@ -43,31 +44,47 @@
 #include "adb_install.h"
 extern "C" {
 #include "minadbd/adb.h"
+#include "rkimage.h"
 }
 
 struct selabel_handle *sehandle;
 
 static const struct option OPTIONS[] = {
+  { "factory_test", no_argument, NULL, 'f'+'t'},
   { "send_intent", required_argument, NULL, 's' },
   { "update_package", required_argument, NULL, 'u' },
+  { "update_rkimage", required_argument, NULL, 'r' },   // support rkimage to update
   { "wipe_data", no_argument, NULL, 'w' },
   { "wipe_cache", no_argument, NULL, 'c' },
   { "show_text", no_argument, NULL, 't' },
+  { "wipe_all", no_argument, NULL, 'w'+'a' },
   { "just_exit", no_argument, NULL, 'x' },
   { NULL, 0, NULL, 0 },
 };
 
 static const char *COMMAND_FILE = "/cache/recovery/command";
+static const char *FLAG_FILE = "/cache/recovery/last_flag";
 static const char *INTENT_FILE = "/cache/recovery/intent";
 static const char *LOG_FILE = "/cache/recovery/log";
 static const char *LAST_LOG_FILE = "/cache/recovery/last_log";
 static const char *LAST_INSTALL_FILE = "/cache/recovery/last_install";
 static const char *CACHE_ROOT = "/cache";
-static const char *SDCARD_ROOT = "/sdcard";
+//static const char *SDCARD_ROOT = "/sdcard";
 static const char *TEMPORARY_LOG_FILE = "/tmp/recovery.log";
 static const char *TEMPORARY_INSTALL_FILE = "/tmp/last_install";
 static const char *SIDELOAD_TEMP_DIR = "/tmp/sideload";
+static const char *AUTO_FACTORY_UPDATE_TAG = "/FirmwareUpdate/auto_sd_update.tag";
+static const char *AUTO_FACTORY_UPDATE_PACKAGE = "/FirmwareUpdate/update.img";
+static char IN_SDCARD_ROOT[64] = "\0";
+static char EX_SDCARD_ROOT[64] = "\0";
+static char updatepath[128] = "\0";
 
+#if TARGET_BOARD_PLATFORM == rockchip
+bool bClearbootmessage=false;
+#endif
+unsigned long default_factory_reset=0;
+
+bool bAutoUpdateComplete = false;
 RecoveryUI* ui = NULL;
 
 /*
@@ -223,11 +240,34 @@ get_args(int *argc, char ***argv) {
 }
 
 static void
-set_sdcard_update_bootloader_message() {
+set_sdcard_update_bootloader_message(const char *package_path) {
     struct bootloader_message boot;
     memset(&boot, 0, sizeof(boot));
     strlcpy(boot.command, "boot-recovery", sizeof(boot.command));
-    strlcpy(boot.recovery, "recovery\n", sizeof(boot.recovery));
+    if(package_path == NULL) {
+    	strlcpy(boot.recovery, "recovery\n", sizeof(boot.recovery));
+    }else {
+    	char cmd[100] = "recovery\n--update_package=";
+    	strcat(cmd, package_path);
+    	strlcpy(boot.recovery, cmd, sizeof(boot.recovery));
+    }
+
+    set_bootloader_message(&boot);
+}
+
+static void
+set_sdcard_update_img_bootloader_message(const char *package_path) {
+    struct bootloader_message boot;
+    memset(&boot, 0, sizeof(boot));
+    strlcpy(boot.command, "boot-recovery", sizeof(boot.command));
+    if(package_path == NULL) {
+    	strlcpy(boot.recovery, "recovery\n", sizeof(boot.recovery));
+    }else {
+    	char cmd[100] = "recovery\n--update_rkimage=";
+    	strcat(cmd, package_path);
+    	strlcpy(boot.recovery, cmd, sizeof(boot.recovery));
+    }
+
     set_bootloader_message(&boot);
 }
 
@@ -283,11 +323,35 @@ finish_recovery(const char *send_intent) {
     chmod(LAST_LOG_FILE, 0640);
     chmod(LAST_INSTALL_FILE, 0644);
 
-    // Reset to normal system boot so recovery won't cycle indefinitely.
-    struct bootloader_message boot;
-    memset(&boot, 0, sizeof(boot));
-    set_bootloader_message(&boot);
+#if TARGET_BOARD_PLATFORM == rockchip
+    // Reset to mormal system boot so recovery won't cycle indefinitely.
+    if( bClearbootmessage!= true )
+    	{
+    		struct bootloader_message boot;
+    		memset(&boot, 0, sizeof(boot));
+    		set_bootloader_message(&boot);
+    	}
+#else
+	struct bootloader_message boot;
+    	memset(&boot, 0, sizeof(boot));
+    	set_bootloader_message(&boot);
+#endif
 
+ 		if (bAutoUpdateComplete==true)
+      	{
+		      FILE *fp = fopen_path(FLAG_FILE, "w");
+		      if (fp == NULL) {
+		            LOGE("Can't open %s\n", FLAG_FILE);
+		      	}
+					char strflag[160]="success$path=";
+					strcat(strflag,updatepath);
+		   		if (fwrite(strflag, 1, sizeof(strflag), fp) != sizeof(strflag)) {
+		      		LOGE("write %s failed! \n", FLAG_FILE);
+		       }
+		      fclose(fp);
+		      bAutoUpdateComplete=false;
+     }
+     
     // Remove the command file, so recovery won't repeat indefinitely.
     if (ensure_path_mounted(COMMAND_FILE) != 0 ||
         (unlink(COMMAND_FILE) && errno != ENOENT)) {
@@ -587,12 +651,12 @@ update_directory(const char* path, const char* unmount_when_done,
             strlcat(new_path, item, PATH_MAX);
 
             ui->Print("\n-- Install %s ...\n", path);
-            set_sdcard_update_bootloader_message();
             char* copy = copy_sideloaded_package(new_path);
             if (unmount_when_done != NULL) {
                 ensure_path_unmounted(unmount_when_done);
             }
             if (copy) {
+            	set_sdcard_update_bootloader_message(NULL);
                 result = install_package(copy, wipe_cache, TEMPORARY_INSTALL_FILE);
                 free(copy);
             } else {
@@ -690,7 +754,7 @@ prompt_and_wait(Device* device) {
                 // standard incremental packages expect to use /cache
                 // as scratch space).
                 ensure_path_mounted(CACHE_ROOT);
-                status = update_directory(SDCARD_ROOT, SDCARD_ROOT, &wipe_cache, device);
+                status = update_directory(EX_SDCARD_ROOT, EX_SDCARD_ROOT, &wipe_cache, device);
                 if (status == INSTALL_SUCCESS && wipe_cache) {
                     ui->Print("\n-- Wiping cache (at package request)...\n");
                     if (erase_volume("/cache")) {
@@ -710,6 +774,24 @@ prompt_and_wait(Device* device) {
                     }
                 }
                 break;
+
+            case Device::RECOVER_SYSTEM:
+            	ui->Print("\n-- Recovery system from backup...\n");
+            	recover_backup("/backup");
+            	ui->Print("Recovery system from backup complete.\n");
+
+            	break;
+
+            case Device::APPLY_INT_RKIMG:
+            	ui->Print("\n-- Update rkimage...\n");
+            	char path[50];
+            	strcpy(path, EX_SDCARD_ROOT);
+            	strcat(path, "/update.img");
+            	set_sdcard_update_img_bootloader_message(NULL);
+            	install_rkimage(path);
+            	ui->Print(" Update rkimage complete.\n");
+            	if (!ui->IsTextVisible()) return;
+            	break;
 
             case Device::APPLY_CACHE:
                 // Don't unmount cache at the end of this.
@@ -757,6 +839,43 @@ print_property(const char *key, const char *name, void *cookie) {
     printf("%s=%s\n", key, name);
 }
 
+void SetSdcardRootPath(void)
+{
+     property_get("InternalSD_ROOT", IN_SDCARD_ROOT, "");
+	   LOGI("InternalSD_ROOT: %s\n", IN_SDCARD_ROOT);	
+	   property_get("ExternalSD_ROOT", EX_SDCARD_ROOT, "");
+	   LOGI("ExternalSD_ROOT: %s\n", EX_SDCARD_ROOT);	
+	   
+	   return;
+}
+
+void SureCacheMount() {
+	if(ensure_path_mounted("/cache")) {
+		printf("mount cache fail,so formate...\n");
+		tmplog_offset = 0;
+		format_volume("/cache");
+		ensure_path_mounted("/cache");
+	}
+}
+
+void get_auto_sdcard_update_path(char **path) {
+	if(!ensure_path_mounted(EX_SDCARD_ROOT)) {
+		char *target = (char *)malloc(100);
+		strcpy(target, EX_SDCARD_ROOT);
+		strcat(target, AUTO_FACTORY_UPDATE_TAG);
+		printf("auto sdcard update path: %s\n", target);
+		FILE* f = fopen(target, "rb");
+		if(f) {
+			*path = (char *)malloc(100);
+			strcpy(*path, EX_SDCARD_ROOT);
+			strcat(*path, AUTO_FACTORY_UPDATE_PACKAGE);
+			printf("find auto sdcard update target file %s\n", *path);
+			free(target);
+		}
+	}
+}
+
+
 int
 main(int argc, char **argv) {
     time_t start = time(NULL);
@@ -764,6 +883,14 @@ main(int argc, char **argv) {
     // If these fail, there's not really anywhere to complain...
     freopen(TEMPORARY_LOG_FILE, "a", stdout); setbuf(stdout, NULL);
     freopen(TEMPORARY_LOG_FILE, "a", stderr); setbuf(stderr, NULL);
+
+#ifdef TARGET_RK30
+    freopen("/dev/ttyFIQ0", "a", stdout); setbuf(stdout, NULL);
+    freopen("/dev/ttyFIQ0", "a", stderr); setbuf(stderr, NULL);
+#else
+    freopen("/dev/ttyS1", "a", stdout); setbuf(stdout, NULL);
+    freopen("/dev/ttyS1", "a", stderr); setbuf(stderr, NULL);
+#endif
 
     // If this binary is started with the single argument "--adbd",
     // instead of being the normal recovery binary, it turns into kind
@@ -785,23 +912,32 @@ main(int argc, char **argv) {
     ui->Init();
     ui->SetBackground(RecoveryUI::NONE);
     load_volume_table();
+    SetSdcardRootPath();
+    SureCacheMount();
+    ui->Print("Recovery system v4.1 \n\n");
     get_args(&argc, &argv);
 
     int previous_runs = 0;
     const char *send_intent = NULL;
     const char *update_package = NULL;
-    int wipe_data = 0, wipe_cache = 0;
+    const char *update_rkimage = NULL;
+    char *auto_sdcard_update_path = NULL;
+    int wipe_data = 0, wipe_cache = 0, wipe_all = 0;
     bool just_exit = false;
-
+    int factory_test_en = 0;
+    char prop[64] = {0};
     int arg;
     while ((arg = getopt_long(argc, argv, "", OPTIONS, NULL)) != -1) {
         switch (arg) {
         case 'p': previous_runs = atoi(optarg); break;
         case 's': send_intent = optarg; break;
         case 'u': update_package = optarg; break;
+	 case 'r':  update_rkimage = optarg; break;
         case 'w': wipe_data = wipe_cache = 1; break;
         case 'c': wipe_cache = 1; break;
+		case 'f'+'t':{ factory_test_en = 1;ui->ShowText(true);} break;
         case 't': ui->ShowText(true); break;
+		 case 'w'+'a':{ wipe_all = wipe_data = wipe_cache = 1;ui->ShowText(true);} break;
         case 'x': just_exit = true; break;
         case '?':
             LOGE("Invalid command argument\n");
@@ -823,7 +959,7 @@ main(int argc, char **argv) {
 #endif
 
     device->StartRecovery();
-
+	get_auto_sdcard_update_path(&auto_sdcard_update_path);
     printf("Command:");
     for (arg = 0; arg < argc; arg++) {
         printf(" \"%s\"", argv[arg]);
@@ -843,6 +979,23 @@ main(int argc, char **argv) {
                    update_package, modified_path);
             update_package = modified_path;
         }
+				strcpy(updatepath,update_package);
+    }
+    printf("\n");
+    if (update_rkimage) {
+        // For backwards compatibility on the cache partition only, if
+        // we're given an old 'root' path "CACHE:foo", change it to
+        // "/cache/foo".
+        if (strncmp(update_rkimage, "CACHE:", 6) == 0) {
+            int len = strlen(update_rkimage) + 10;
+            char* modified_path = (char *)malloc(len);
+            strlcpy(modified_path, "/cache/", len);
+            strlcat(modified_path, update_rkimage+6, len);
+            printf("(replacing path \"%s\" with \"%s\")\n",
+                   update_rkimage, modified_path);
+            update_rkimage = modified_path;
+        }
+        strcpy(updatepath,update_rkimage);
     }
     printf("\n");
 
@@ -850,8 +1003,23 @@ main(int argc, char **argv) {
     printf("\n");
 
     int status = INSTALL_SUCCESS;
+    if(factory_test_en)
+    {
+    	ui->Print("\nwait factory test tool connect........\n");
+        char factory_test_finish = 0;    
+        while(1)
+        {
+            property_get("FACTORY_TEST_FINISH", prop, "0");
+            factory_test_finish = (char)strtoumax(prop, 0, 16);
+            if(factory_test_finish != 0)break;
+            sleep(1);
+        }
+        ui->Print("\n factory test finish........\n");
+        
+    }
 
     if (update_package != NULL) {
+		printf("update_package = %s", update_package);
         status = install_package(update_package, &wipe_cache, TEMPORARY_INSTALL_FILE);
         if (status == INSTALL_SUCCESS && wipe_cache) {
             if (erase_volume("/cache")) {
@@ -859,10 +1027,28 @@ main(int argc, char **argv) {
             }
         }
         if (status != INSTALL_SUCCESS) ui->Print("Installation aborted.\n");
+        else
+	 				bAutoUpdateComplete=true;
+    } else if (update_rkimage != NULL) {
+        status = install_rkimage(update_rkimage);
+        if (status != INSTALL_SUCCESS) ui->Print("Installation aborted.\n");
+        else
+	 				bAutoUpdateComplete=true;
+    } else if(auto_sdcard_update_path) {
+    	printf("auto install package from sdcard!\n");
+    	status = install_rkimage(auto_sdcard_update_path);
+    	if (status == INSTALL_SUCCESS && wipe_cache) {
+    	            if (erase_volume("/cache")) {
+    	                LOGE("Cache wipe (requested by package) failed.");
+    	            }
+    	}
+
+    	if (status != INSTALL_SUCCESS) ui->Print("Installation aborted.\n");
     } else if (wipe_data) {
         if (device->WipeData()) status = INSTALL_ERROR;
         if (erase_volume("/data")) status = INSTALL_ERROR;
         if (wipe_cache && erase_volume("/cache")) status = INSTALL_ERROR;
+		if (wipe_all && erase_volume(IN_SDCARD_ROOT)) status = INSTALL_ERROR;
         if (status != INSTALL_SUCCESS) ui->Print("Data wipe failed.\n");
     } else if (wipe_cache) {
         if (wipe_cache && erase_volume("/cache")) status = INSTALL_ERROR;
@@ -871,8 +1057,11 @@ main(int argc, char **argv) {
         status = INSTALL_ERROR;  // No command specified
     }
 
-    if (status != INSTALL_SUCCESS) ui->SetBackground(RecoveryUI::ERROR);
-    if (status != INSTALL_SUCCESS || ui->IsTextVisible()) {
+    if (status != INSTALL_SUCCESS) {
+	ui->SetBackground(RecoveryUI::ERROR);
+	bClearbootmessage = false;
+    }
+    if (status != INSTALL_SUCCESS) {
         prompt_and_wait(device);
     }
 

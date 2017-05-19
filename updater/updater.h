@@ -35,4 +35,29 @@ typedef struct {
 
 extern struct selabel_handle *sehandle;
 
+typedef struct {
+    const char* mount_point;  // eg. "/cache".  must live in the root directory.
+
+    const char* fs_type;      // "yaffs2" or "ext4" or "vfat"
+
+    const char* device;       // MTD partition name if fs_type == "yaffs"
+                              // block device if fs_type == "ext4" or "vfat"
+
+    const char* device2;      // alternative device to try if fs_type
+                              // == "ext4" or "vfat" and mounting
+                              // 'device' fails
+
+    long long length;         // (ext4 partition only) when
+                              // formatting, size to use for the
+                              // partition.  0 or negative number
+                              // means to format all but the last
+                              // (that much).
+} Volume;
+
+struct bootloader_message {
+    char command[32];
+    char status[32];
+    char recovery[1024];
+};
+
 #endif

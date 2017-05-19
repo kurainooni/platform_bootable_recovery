@@ -37,10 +37,25 @@
 #include "mtdutils/mtdutils.h"
 #include "updater.h"
 #include "applypatch/applypatch.h"
+#include "cutils/android_reboot.h"
 
 #ifdef USE_EXT4
 #include "make_ext4fs.h"
 #endif
+
+#include "mtdutils/rk29.h"
+
+static int set_bootloader_message(const struct bootloader_message *in);
+static int set_bootloader_message_block_rk29(const struct bootloader_message *in, const Volume* v);
+static int set_bootloader_message_mtd(const struct bootloader_message *in, const Volume* v);
+static int set_bootloader_message_block(const struct bootloader_message *in, const Volume* v);
+static void load_volume_table();
+static Volume* volume_for_path(const char* path);
+static int parse_options(char* options, Volume* volume);
+
+extern char* g_package_file;
+static int num_volumes = 0;
+static Volume* device_volumes = NULL;
 
 // mount(fs_type, partition_type, location, mount_point)
 //
@@ -270,6 +285,27 @@ Value* FormatFn(const char* name, State* state, int argc, Expr* argv[]) {
             goto done;
         }
         result = location;
+#endif
+#if TARGET_BOARD_PLATFORM == rockchip
+    } else if (strcmp(fs_type, "ext3") == 0) {
+        int status = make_ext3fs(location);
+        if (status != 0) {
+            fprintf(stderr, "%s: make_ext3fs failed (%d) on %s",
+                    name, status, location);
+            result = strdup("");
+            goto done;
+        }
+        result = location;
+    } else if (strcmp(fs_type, "vfat") == 0) {
+		char volume_label[16] = "\0";
+		property_get("UserVolumeLabel", volume_label, "");
+		printf("VolumeLabel: %s\n", volume_label);
+		int status = make_vfat(location, volume_label);
+		if (status != 0) {
+			fprintf(stderr, "format_volume: make_vfat failed on %s\n", location);
+			goto done;
+		 }
+		result = location;
 #endif
     } else {
         fprintf(stderr, "%s: unsupported fs_type \"%s\" partition_type \"%s\"",
@@ -793,6 +829,344 @@ done:
     return StringValue(result);
 }
 
+//add by mmk@rock-chips.com
+//update the parameter partition
+Value* WriteRawParameterImageFn(const char* name, State* state, int argc, Expr* argv[]) {
+    char* result = NULL;
+
+    Value* partition_value;
+    Value* contents;
+    if (ReadValueArgs(state, argv, 2, &contents, &partition_value) < 0) {
+        return NULL;
+    }
+
+    if (partition_value->type != VAL_STRING) {
+        ErrorAbort(state, "partition argument to %s must be string", name);
+        goto done;
+    }
+    char* partition = partition_value->data;
+    if (strlen(partition) == 0) {
+        ErrorAbort(state, "partition argument to %s can't be empty", name);
+        goto done;
+    }
+
+    if (strcmp(partition, "parameter")) {
+    	ErrorAbort(state, "partition argument to %s not be parameter", name);
+        goto done;
+    }
+
+    if (contents->type == VAL_STRING) {
+        ErrorAbort(state, "file argument to %s can't support", name);
+        goto done;
+    }
+
+    mtd_scan_partitions();
+    const MtdPartition* mtd = mtd_find_partition_by_name(partition);
+    if (mtd == NULL) {
+        fprintf(stderr, "%s: no mtd partition named \"%s\"\n", name, partition);
+        result = strdup("");
+        goto done;
+    }
+
+    MtdReadContext* ctx_read = mtd_read_partition(mtd);
+    if (ctx_read == NULL) {
+    	fprintf(stderr, "%s: can't read mtd partition \"%s\"\n",
+    			name, partition);
+    	result = strdup("");
+    	goto done;
+    }
+
+    printf("start compare parameter\n");
+    //compare the new parameter and old parameter
+    bool isParemeterSame = true;
+    size_t once_len = 16*1024;
+    size_t compared_len = 0;
+    char* old_parameter_buf = malloc(once_len);
+    while(compared_len < contents->size) {
+    	memset(old_parameter_buf, 0, once_len);
+    	size_t read = mtd_read_data(ctx_read, old_parameter_buf, once_len);
+    	if(read != once_len) {
+    		printf("read old_parameter error!\n");
+    		result = strdup("");
+    		mtd_read_close(ctx_read);
+    		goto done;
+    	}
+
+    	size_t realCompareSize = ((compared_len + read) < contents->size) ? read : (contents->size - compared_len);
+    	if(memcmp(contents->data + compared_len, old_parameter_buf, realCompareSize)) {
+    		isParemeterSame = false;
+    		break;
+    	}
+
+    	compared_len += read;
+    }
+
+    if(isParemeterSame) {
+    	printf("parameter is same, not update!\n");
+    	result = partition;
+    	mtd_read_close(ctx_read);
+    	goto done;
+    }
+
+    mtd_read_close(ctx_read);
+
+    //update parameter
+    MtdWriteContext* ctx = mtd_write_partition(mtd);
+    if (ctx == NULL) {
+        fprintf(stderr, "%s: can't write mtd partition \"%s\"\n",
+                name, partition);
+        result = strdup("");
+        goto done;
+    }
+
+    bool success;
+
+    // we're given a blob as the contents
+    ssize_t wrote = mtd_write_data(ctx, contents->data, contents->size);
+    success = (wrote == contents->size);
+
+    if (!success) {
+        fprintf(stderr, "mtd_write_data to %s failed: %s\n",
+                partition, strerror(errno));
+    }
+
+    if (mtd_erase_blocks(ctx, -1) == -1) {
+        fprintf(stderr, "%s: error erasing blocks of %s\n", name, partition);
+    }
+    if (mtd_write_close(ctx) != 0) {
+        fprintf(stderr, "%s: error closing write of %s\n", name, partition);
+    }
+
+    result = success ? partition : strdup("");
+
+    printf("the package path is %s\n", g_package_file);
+    struct bootloader_message boot;
+    memset(&boot, 0, sizeof(boot));
+    strlcpy(boot.command, "boot-recovery", sizeof(boot.command));
+    char cmd[100] = "recovery\n--update_package=";
+    strcat(cmd, g_package_file);
+    strlcpy(boot.recovery, cmd, sizeof(boot.recovery));
+    set_bootloader_message(&boot);
+
+    printf("update parameter success, reboot now...\n");
+    android_reboot(ANDROID_RB_RESTART2, 0, "recovery");
+
+done:
+	free(old_parameter_buf);
+    if (result != partition) FreeValue(partition_value);
+    FreeValue(contents);
+    return StringValue(result);
+}
+
+Value* ClearMiscCommandFn(const char* name, State* state, int argc, Expr* argv[]) {
+	printf("clear misc command!\n");
+	struct bootloader_message boot;
+	memset(&boot, 0, sizeof(boot));
+	set_bootloader_message(&boot);
+
+	return StringValue(strdup(""));
+}
+
+static int parse_options(char* options, Volume* volume) {
+    char* option;
+    while (option = strtok(options, ",")) {
+        options = NULL;
+
+        if (strncmp(option, "length=", 7) == 0) {
+            volume->length = strtoll(option+7, NULL, 10);
+        } else {
+        	printf("bad option \"%s\"\n", option);
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static void load_volume_table() {
+    int alloc = 2;
+    device_volumes = malloc(alloc * sizeof(Volume));
+
+    // Insert an entry for /tmp, which is the ramdisk and is always mounted.
+    device_volumes[0].mount_point = "/tmp";
+    device_volumes[0].fs_type = "ramdisk";
+    device_volumes[0].device = NULL;
+    device_volumes[0].device2 = NULL;
+    device_volumes[0].length = 0;
+    num_volumes = 1;
+
+    FILE* fstab = fopen("/etc/recovery.fstab", "r");
+    if (fstab == NULL) {
+    	printf("failed to open /etc/recovery.fstab (%s)\n", strerror(errno));
+        return;
+    }
+
+    char buffer[1024];
+    int i;
+    while (fgets(buffer, sizeof(buffer)-1, fstab)) {
+        for (i = 0; buffer[i] && isspace(buffer[i]); ++i);
+        if (buffer[i] == '\0' || buffer[i] == '#') continue;
+
+        char* original = strdup(buffer);
+
+        char* mount_point = strtok(buffer+i, " \t\n");
+        char* fs_type = strtok(NULL, " \t\n");
+        char* device = strtok(NULL, " \t\n");
+        // lines may optionally have a second device, to use if
+        // mounting the first one fails.
+        char* options = NULL;
+        char* device2 = strtok(NULL, " \t\n");
+        if (device2) {
+            if (device2[0] == '/') {
+                options = strtok(NULL, " \t\n");
+            } else {
+                options = device2;
+                device2 = NULL;
+            }
+        }
+
+        if (mount_point && fs_type && device) {
+            while (num_volumes >= alloc) {
+                alloc *= 2;
+                device_volumes = realloc(device_volumes, alloc*sizeof(Volume));
+            }
+            device_volumes[num_volumes].mount_point = strdup(mount_point);
+            device_volumes[num_volumes].fs_type = strdup(fs_type);
+            device_volumes[num_volumes].device = strdup(device);
+            device_volumes[num_volumes].device2 =
+                device2 ? strdup(device2) : NULL;
+
+            device_volumes[num_volumes].length = 0;
+            if (parse_options(options, device_volumes + num_volumes) != 0) {
+            	printf("skipping malformed recovery.fstab line: %s\n", original);
+            } else {
+                ++num_volumes;
+            }
+        } else {
+        	printf("skipping malformed recovery.fstab line: %s\n", original);
+        }
+        free(original);
+    }
+
+    fclose(fstab);
+
+    printf("recovery filesystem table\n");
+    printf("=========================\n");
+    for (i = 0; i < num_volumes; ++i) {
+        Volume* v = &device_volumes[i];
+        printf("  %d %s %s %s %s %lld\n", i, v->mount_point, v->fs_type,
+               v->device, v->device2, v->length);
+    }
+    printf("\n");
+}
+
+static Volume* volume_for_path(const char* path) {
+    int i;
+    for (i = 0; i < num_volumes; ++i) {
+        Volume* v = device_volumes+i;
+        int len = strlen(v->mount_point);
+        if (strncmp(path, v->mount_point, len) == 0 &&
+            (path[len] == '\0' || path[len] == '/')) {
+            return v;
+        }
+    }
+    return NULL;
+}
+
+static int set_bootloader_message(const struct bootloader_message *in) {
+	if(device_volumes == NULL) {
+		load_volume_table();
+	}
+    Volume* v = volume_for_path("/misc");
+    if (v == NULL) {
+      printf("Cannot load volume /misc!\n");
+      return -1;
+    }
+    if (strcmp(v->fs_type, "mtd") == 0) {
+        return set_bootloader_message_mtd(in, v);
+    } else if (strcmp(v->fs_type, "emmc") == 0) {
+    	return set_bootloader_message_block_rk29(in, v);
+    }
+    printf("unknown misc partition fs_type \"%s\"\n", v->fs_type);
+    return -1;
+}
+
+static const int MISC_PAGES = 3;         // number of pages to save
+static const int MISC_COMMAND_PAGE = 1;  // bootloader command is this page
+
+static int set_bootloader_message_mtd(const struct bootloader_message *in,
+                                      const Volume* v) {
+    size_t write_size;
+    mtd_scan_partitions();
+    const MtdPartition *part = mtd_find_partition_by_name(v->device);
+    if (part == NULL || mtd_partition_info(part, NULL, NULL, &write_size)) {
+    	printf("Can't find %s\n", v->device);
+        return -1;
+    }
+
+    MtdReadContext *read = mtd_read_partition(part);
+    if (read == NULL) {
+    	printf("Can't open %s\n(%s)\n", v->device, strerror(errno));
+        return -1;
+    }
+
+    ssize_t size = write_size * MISC_PAGES;
+    char data[size];
+    ssize_t r = mtd_read_data(read, data, size);
+    if (r != size) printf("Can't read %s\n(%s)\n", v->device, strerror(errno));
+    mtd_read_close(read);
+    if (r != size) return -1;
+
+    memcpy(&data[write_size * MISC_COMMAND_PAGE], in, sizeof(*in));
+
+    MtdWriteContext *write = mtd_write_partition(part);
+    if (write == NULL) {
+    	printf("Can't open %s\n(%s)\n", v->device, strerror(errno));
+        return -1;
+    }
+    if (mtd_write_data(write, data, size) != size) {
+    	printf("Can't write %s\n(%s)\n", v->device, strerror(errno));
+        mtd_write_close(write);
+        return -1;
+    }
+    if (mtd_write_close(write)) {
+    	printf("Can't finish %s\n(%s)\n", v->device, strerror(errno));
+        return -1;
+    }
+
+    printf("Set boot command \"%s\"\n", in->command[0] != 255 ? in->command : "");
+    return 0;
+}
+
+static int set_bootloader_message_block_rk29(const struct bootloader_message *in,
+                                        const Volume* v) {
+
+    FILE* f = fopen(v->device, "wb+");
+
+    if (f == NULL) {
+    	printf("Can't open %s\n(%s)\n", v->device, strerror(errno));
+        return -1;
+    }
+
+    const ssize_t size =WRITE_SIZE * MISC_PAGES;
+    char data[size];
+
+    memset(data,0,size);
+    memcpy(&data[WRITE_SIZE * MISC_COMMAND_PAGE], in, sizeof(*in));
+
+    int count = rk29_fwrite(data, size, 1, f);
+
+    if (count != 1) {
+    	printf("Failed writing %s\n(%s)\n", v->device, strerror(errno));
+        fclose(f);
+        return -1;
+    }
+    if (fclose(f) != 0) {
+    	printf("Failed closing %s\n(%s)\n", v->device, strerror(errno));
+        return -1;
+    }
+    return 0;
+}
+
 // apply_patch_space(bytes)
 Value* ApplyPatchSpaceFn(const char* name, State* state,
                          int argc, Expr* argv[]) {
@@ -1117,6 +1491,8 @@ void RegisterInstallFunctions() {
     RegisterFunction("getprop", GetPropFn);
     RegisterFunction("file_getprop", FileGetPropFn);
     RegisterFunction("write_raw_image", WriteRawImageFn);
+    RegisterFunction("write_raw_parameter_image", WriteRawParameterImageFn);
+    RegisterFunction("clear_misc_command", ClearMiscCommandFn);
 
     RegisterFunction("apply_patch", ApplyPatchFn);
     RegisterFunction("apply_patch_check", ApplyPatchCheckFn);
